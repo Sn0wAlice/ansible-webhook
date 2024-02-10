@@ -1,0 +1,327 @@
+---
+- hosts: servers
+  become: true
+  become_user: root
+  become_method: sudo
+  vars:
+    ansible_become_pass: "{{ root_password }}"
+
+  tasks:
+    # Step 1: Install all the matchine prerequisites
+    - name: Upgrade all package
+      apt:
+        update_cache: yes
+    - name: Upgrade packages
+      apt:
+        upgrade: yes
+
+    # Step 2: Install kibelet kubeadm kubectl
+
+    # Step 2.1: install deps
+    - name: Install dependencies curl, apt-transport-https [...]
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - curl
+        - wget
+        - git
+        - apt-transport-https
+        - ca-certificates
+        - software-properties-common
+      
+    - name: Add Kubernetes GPG key
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+        state: present
+    
+    # Step 2.2: kubelet kubeadm kubectl
+    - name: Run apt update
+      apt:
+        update_cache: yes
+
+    - name: Install kubelet kubeadm kubectl
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - kubelet
+        - kubeadm
+        - kubectl
+        - kubernetes
+
+    # Step 2.3: Hold the version ## not working ansible shows error
+    #- name: Hold the version
+    #  apt:
+    #    name: "{{ item }}"
+    #    state: held
+    #  with_items:
+    #    - kubelet
+    #    - kubeadm
+    #    - kubectl
+    #    - kubernetes
+    
+    # Step 3: Disable swap permanently on all nodes
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Remove swap from /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^.*swap.*$'
+        replace: ''
+      when: ansible_swaptotal_mb > 0
+
+    - name: free -m
+      command: free -m
+      register: free_mem
+    - debug: var=free_mem
+
+    # Step 3.2: enable kernel modules
+    - name: Enable kernel modules
+      command: modprobe br_netfilter
+      ignore_errors: yes
+
+    - name: Enable kernel modules
+      command: modprobe overlay
+      ignore_errors: yes
+
+    # Step 3.3: add settings to sysctl
+    - name: Add settings to sysctl
+      sysctl:
+        name: "{{ item }}"
+        value: 1
+        state: present
+        reload: yes
+      with_items:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+        - net.ipv4.conf.all.forwarding
+        - net.ipv4.conf.all.proxy_arp
+        - net.ipv6.conf.all.forwarding
+        - net.ipv6.conf.all.proxy_ndp
+        - net.ipv6.conf.default.forwarding
+        - net.ipv6.conf.default.proxy_ndp
+    
+      
+    # Step 3.4: reload sysctl
+    - name: Reload sysctl
+      command: sysctl --system
+
+    # Step 4: Install Docker
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Get ubuntu version
+      shell: |
+        lsb_release -cs
+      register: ubuntu_version
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu {{ ubuntu_version.stdout }} stable
+        state: present
+
+    - name: Run apt update
+      apt:
+        update_cache: yes
+
+    - name: Install Docker
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - docker.io
+        - containerd
+        - docker-ce
+        - docker-ce-cli
+    
+    # Step 4.1: Create directory for /etc/systemd/system/docker.service.d
+    - name: Create directory for /etc/systemd/system/docker.service.d
+      file:
+        path: /etc/systemd/system/docker.service.d
+        state: directory
+
+    # Step 4.2: create daemon json config file
+    - name: Create daemon json config file
+      copy:
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "100m"
+            },
+            "storage-driver": "overlay2"
+          }
+        dest: /etc/docker/daemon.json
+    
+    # Step 4.3: Reload daemon
+    - name: Reload daemon
+      systemd:
+        daemon_reload: yes
+
+    # Step 4.4: Start docker
+    - name: Start docker
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    # Step 4.4: configure persistent loading of kernel modules
+    - name: configure persistent loading of kernel modules
+      lineinfile:
+        path: /etc/modules-load.d/k8s.conf
+        line: "{{ item }}"
+        create: yes
+      with_items:
+        - br_netfilter
+        - overlay
+
+    # Step 4.5: Load kernel modules
+    - name: Load kernel modules
+      command: modprobe {{ item }}
+      with_items:
+        - br_netfilter
+        - overlay
+
+        # Step 5: Install cri-dockerd
+
+    # Step 5.1: Get version with shell
+    - name: Get version with shell, and register it
+      shell: |
+        VER=$(curl -s https://api.github.com/repos/Mirantis/cri-dockerd/releases/latest|grep tag_name | cut -d '"' -f 4|sed 's/v//g')
+        echo $VER
+      register: version
+
+    # Step 5.2: get server arch
+    - name: get server arch with shell, and register it
+      shell: |
+        ARCH=$(uname -m)
+        echo $ARCH
+      register: arch
+
+    - name: downlaod amd64
+      when: arch.stdout == "x86_64"
+      shell: |
+        echo "Step 5.2 :: install cri-dockerd for x86_64"
+        wget https://github.com/Mirantis/cri-dockerd/releases/download/v{{ version.stdout }}/cri-dockerd-{{ version.stdout }}.amd64.tgz
+        tar xvf cri-dockerd-{{ version.stdout }}.amd64.tgz
+
+    - name: downlaod arm64
+      when: arch.stdout == "aarch64"
+      shell: |
+        echo "Step 5.2 :: install cri-dockerd for arm64"
+        wget https://github.com/Mirantis/cri-dockerd/releases/download/v{{ version.stdout }}/cri-dockerd-{{ version.stdout }}.arm64.tgz
+        tar xvf cri-dockerd-{{ version.stdout }}.amd64.tgz
+
+      
+    # Step 5.3: Move the binary to /usr/local/bin
+    - name: Move the binary to /usr/local/bin
+      shell: mv cri-dockerd/cri-dockerd /usr/local/bin
+
+    # Step 5.4: Configure the service, by downloading config file
+    - name: Configure the service, by downloading config file
+      shell: wget https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.service -O /etc/systemd/system/cri-docker.service
+
+    - name: socket file
+      shell: wget https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.socket -O /etc/systemd/system/cri-docker.socket
+
+    # add the service
+    - name: add the service
+      shell: sed -i -e 's,/usr/bin/cri-dockerd,/usr/local/bin/cri-dockerd,' /etc/systemd/system/cri-docker.service
+
+    - name: restart docker
+      service:
+        name: docker
+        state: restarted
+
+    # Step 5.5: reload daemon and start the service
+    - name: reload daemon and start the service
+      shell: systemctl daemon-reload && systemctl enable --now cri-docker
+
+    # Step 5.6: enable the service kubelet
+    - name: enable the service kubelet
+      service:
+        name: kubelet
+        state: started
+        enabled: yes
+
+
+# Second part of the playbook: only for the master node
+- hosts: master
+  become: true
+  become_user: root
+  become_method: sudo
+  vars:
+    ansible_become_pass: "{{ root_password }}"
+
+  tasks:
+    # Step 6: Initialize the master node
+    - name: Initialize the master node
+      command: kubeadm config images pull --cri-socket /run/cri-dockerd.sock 
+
+    # Step 6.1: Initialize the master node
+    - name: Initialize the master node
+      command: kubeadm init --cri-socket /run/cri-dockerd.sock --pod-network-cidr=10.244.0.0/16 --control-plane-endpoint={{ master_ip }}
+
+    # create the kube config
+    - name: create the kube config
+      shell: |
+        mkdir -p $HOME/.kube
+        cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+        chown $(id -u):$(id -g) $HOME/.kube/config
+
+    # Step 6.2: generate the join command
+    - name: generate the join command
+      shell: |
+        kubeadm token create --print-join-command > kubeadm-join.sh
+
+    # Step 6.3: get the value of the join command in ansible
+    - name: get the value of the join command in ansible
+      shell: cat kubeadm-join.sh
+      register: join_command
+
+    - name: sleep a minutes
+      pause:
+        seconds: 60
+
+    - name: init the flannel network
+      shell: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+
+- hosts: workers
+  become: true
+  become_user: root
+  become_method: sudo
+  vars:
+    ansible_become_pass: "{{ root_password }}"
+
+  tasks:
+      # Step 6: Initialize the master node
+    - name: Initialize the worker node
+      command: kubeadm config images pull --cri-socket /run/cri-dockerd.sock
+
+    # Step 6.1: Initialize the master node
+    - name: Initialize the master node
+      command: kubeadm init --cri-socket /run/cri-dockerd.sock --pod-network-cidr=10.244.0.0/16
+
+    # create the kube config
+    - name: create the kube config
+      shell: |
+        mkdir -p $HOME/.kube
+        cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+        chown $(id -u):$(id -g) $HOME/.kube/config
+
+    # Step 7: Join the worker nodes to the cluster
+    - name: Join the worker nodes to the cluster
+      command: "{{ hostvars['master']['join_command']['stdout'] }}" 
